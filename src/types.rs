@@ -104,6 +104,38 @@ pub enum BufferType {
     PluginConfiguration = 7,
     CallData = 8,
     RedisCallResponse = 9,
+    /// Higress PostgreSQL call response. Available only during its callback.
+    PgCallResponse = 10,
+}
+
+/// PostgreSQL completion status, independent of the hostcall submission status.
+#[repr(u32)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum PgCallStatus {
+    Ok = 0,
+    DatabaseError = 1,
+    NetworkError = 2,
+    Timeout = 3,
+    AuthenticationError = 4,
+    ProtocolError = 5,
+    ResourceExhausted = 6,
+}
+
+impl std::convert::TryFrom<u32> for PgCallStatus {
+    type Error = u32;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Ok),
+            1 => Ok(Self::DatabaseError),
+            2 => Ok(Self::NetworkError),
+            3 => Ok(Self::Timeout),
+            4 => Ok(Self::AuthenticationError),
+            5 => Ok(Self::ProtocolError),
+            6 => Ok(Self::ResourceExhausted),
+            other => Err(other),
+        }
+    }
 }
 
 #[repr(u32)]

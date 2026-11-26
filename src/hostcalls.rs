@@ -22,6 +22,109 @@ extern "C" {
 }
 
 pub type RedisCallbackFn = dyn FnOnce(u32, usize, usize);
+pub type PgCallbackFn = dyn FnOnce(u32, u32, usize);
+
+/// Raw ABI status: unknown host values remain representable, without an FFI enum.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct PgHostcallError(pub u32);
+
+impl std::fmt::Display for PgHostcallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PostgreSQL hostcall failed (status {})", self.0)
+    }
+}
+
+impl std::error::Error for PgHostcallError {}
+
+extern "C" {
+    fn proxy_pg_init(
+        upstream_data: *const u8,
+        upstream_size: usize,
+        config_data: *const u8,
+        config_size: usize,
+        return_client: *mut u32,
+    ) -> u32;
+    fn proxy_pg_call(
+        client_id: u32,
+        request_data: *const u8,
+        request_size: usize,
+        timeout_ms: u32,
+        return_token: *mut u32,
+    ) -> u32;
+}
+
+/// Configure a root-scoped client; the connection is established lazily.
+pub fn pg_init(upstream: &str, config: &[u8]) -> Result<u32, PgHostcallError> {
+    if upstream.is_empty() || upstream.contains('\0') || config.is_empty() {
+        return Err(PgHostcallError(Status::BadArgument as u32));
+    }
+    let mut client = 0;
+    let status = unsafe {
+        proxy_pg_init(
+            upstream.as_ptr(),
+            upstream.len(),
+            config.as_ptr(),
+            config.len(),
+            &mut client,
+        )
+    };
+    match status {
+        0 if client != 0 => Ok(client),
+        0 => Err(PgHostcallError(Status::InternalFailure as u32)),
+        other => Err(PgHostcallError(other)),
+    }
+}
+
+pub fn dispatch_pg_call(
+    client_id: u32,
+    request: &[u8],
+    timeout: Duration,
+    callback: Box<PgCallbackFn>,
+) -> Result<u32, PgHostcallError> {
+    let millis = timeout.as_millis();
+    if client_id == 0 || request.is_empty() || millis == 0 || millis > u32::MAX as u128 {
+        return Err(PgHostcallError(Status::BadArgument as u32));
+    }
+    let mut token = 0;
+    let status = unsafe {
+        proxy_pg_call(
+            client_id,
+            request.as_ptr(),
+            request.len(),
+            millis as u32,
+            &mut token,
+        )
+    };
+    if status != 0 {
+        return Err(PgHostcallError(status));
+    }
+    if token == 0 || !dispatcher::register_pg_callout(token, callback) {
+        return Err(PgHostcallError(Status::InternalFailure as u32));
+    }
+    Ok(token)
+}
+
+/// Read while handling proxy_on_pg_call_response; the returned data is owned.
+pub fn get_pg_call_response(max_size: usize) -> Result<Option<Bytes>, PgHostcallError> {
+    let mut data = null_mut();
+    let mut size = 0;
+    let status = unsafe {
+        proxy_get_buffer_bytes(
+            BufferType::PgCallResponse,
+            0,
+            max_size,
+            &mut data,
+            &mut size,
+        )
+    };
+    match status {
+        0 if data.is_null() && size == 0 => Ok(None),
+        0 if !data.is_null() => Ok(Some(unsafe { Vec::from_raw_parts(data, size, size) })),
+        0 => Err(PgHostcallError(Status::InternalFailure as u32)),
+        1 => Ok(None),
+        other => Err(PgHostcallError(other)),
+    }
+}
 
 pub fn log(level: LogLevel, message: &str) -> Result<(), Status> {
     unsafe {
@@ -80,7 +183,7 @@ extern "C" {
         max_size: usize,
         return_buffer_data: *mut *mut u8,
         return_buffer_size: *mut usize,
-    ) -> Status;
+    ) -> u32;
 }
 
 pub fn get_buffer(
@@ -98,7 +201,7 @@ pub fn get_buffer(
             &mut return_data,
             &mut return_size,
         ) {
-            Status::Ok => {
+            0 => {
                 if !return_data.is_null() {
                     Ok(Some(Vec::from_raw_parts(
                         return_data,
@@ -109,8 +212,8 @@ pub fn get_buffer(
                     Ok(None)
                 }
             }
-            Status::NotFound => Ok(None),
-            status => panic!("unexpected status: {}", status as u32),
+            1 => Ok(None),
+            status => panic!("unexpected status: {}", status),
         }
     }
 }

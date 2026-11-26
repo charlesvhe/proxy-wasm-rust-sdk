@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::hostcalls;
-use crate::hostcalls::RedisCallbackFn;
+use crate::hostcalls::{PgCallbackFn, RedisCallbackFn};
 use crate::traits::*;
 use crate::types::*;
 use hashbrown::HashMap;
@@ -52,6 +52,10 @@ pub(crate) fn register_redis_callout(token_id: u32, call_fn: Box<RedisCallbackFn
     DISPATCHER.with(|dispatcher| dispatcher.register_redis_callout(token_id, call_fn));
 }
 
+pub(crate) fn register_pg_callout(token_id: u32, callback: Box<PgCallbackFn>) -> bool {
+    DISPATCHER.with(|dispatcher| dispatcher.register_pg_callout(token_id, callback))
+}
+
 struct NoopRoot;
 
 impl Context for NoopRoot {}
@@ -69,6 +73,7 @@ struct Dispatcher {
     grpc_callouts: RefCell<HashMap<u32, u32>>,
     grpc_streams: RefCell<HashMap<u32, u32>>,
     redis_callouts: RefCell<HashMap<u32, (u32, Box<RedisCallbackFn>)>>,
+    pg_callouts: RefCell<HashMap<u32, (u32, Box<PgCallbackFn>)>>,
 }
 
 impl Dispatcher {
@@ -85,6 +90,7 @@ impl Dispatcher {
             grpc_callouts: RefCell::new(HashMap::new()),
             grpc_streams: RefCell::new(HashMap::new()),
             redis_callouts: RefCell::new(HashMap::new()),
+            pg_callouts: RefCell::new(HashMap::new()),
         }
     }
 
@@ -141,6 +147,30 @@ impl Dispatcher {
             .is_some()
         {
             panic!("duplicate token_id")
+        }
+    }
+
+    fn register_pg_callout(&self, token_id: u32, callback: Box<PgCallbackFn>) -> bool {
+        let mut pending = self.pg_callouts.borrow_mut();
+        if pending.contains_key(&token_id) {
+            return false;
+        }
+        pending.insert(token_id, (self.active_id.get(), callback));
+        true
+    }
+
+    fn on_pg_call_response(&self, token_id: u32, status: u32, response_size: usize) {
+        let entry = self.pg_callouts.borrow_mut().remove(&token_id);
+        if let Some((context_id, callback)) = entry {
+            let exists = self.http_streams.borrow().contains_key(&context_id)
+                || self.streams.borrow().contains_key(&context_id)
+                || self.roots.borrow().contains_key(&context_id);
+            if !exists || hostcalls::set_effective_context(context_id).is_err() {
+                return;
+            }
+            let previous = self.active_id.replace(context_id);
+            callback(token_id, status, response_size);
+            self.active_id.set(previous);
         }
     }
 
@@ -253,7 +283,24 @@ impl Dispatcher {
         }
     }
 
+    fn remove_pg_context(&self, context_id: u32) {
+        // Drop user captures after releasing the map borrow (Drop can reenter the SDK).
+        let removed: Vec<_> = {
+            let mut pending = self.pg_callouts.borrow_mut();
+            let tokens: Vec<_> = pending
+                .iter()
+                .filter_map(|(token, (owner, _))| (*owner == context_id).then_some(*token))
+                .collect();
+            tokens
+                .into_iter()
+                .filter_map(|token| pending.remove(&token))
+                .collect()
+        };
+        drop(removed);
+    }
+
     fn on_delete(&self, context_id: u32) {
+        self.remove_pg_context(context_id);
         if !(self.http_streams.borrow_mut().remove(&context_id).is_some()
             || self.streams.borrow_mut().remove(&context_id).is_some()
             || self.roots.borrow_mut().remove(&context_id).is_some())
@@ -735,6 +782,16 @@ pub extern "C" fn proxy_on_redis_call_response(
 }
 
 #[no_mangle]
+pub extern "C" fn proxy_on_pg_call_response(
+    _context_id: u32,
+    token_id: u32,
+    status: u32,
+    response_size: usize,
+) {
+    DISPATCHER.with(|dispatcher| dispatcher.on_pg_call_response(token_id, status, response_size));
+}
+
+#[no_mangle]
 pub extern "C" fn proxy_on_grpc_receive_initial_metadata(
     _context_id: u32,
     token_id: u32,
@@ -760,4 +817,68 @@ pub extern "C" fn proxy_on_grpc_receive_trailing_metadata(
 #[no_mangle]
 pub extern "C" fn proxy_on_grpc_close(_context_id: u32, token_id: u32, status_code: u32) {
     DISPATCHER.with(|dispatcher| dispatcher.on_grpc_close(token_id, status_code))
+}
+
+#[cfg(test)]
+mod pg_tests {
+    use super::*;
+    use std::rc::Rc;
+
+    #[test]
+    fn duplicate_pg_token_preserves_original_callback() {
+        let dispatcher = Dispatcher::new();
+        let called = Rc::new(Cell::new(0));
+        let first = called.clone();
+        assert!(dispatcher.register_pg_callout(12, Box::new(move |_, _, _| first.set(1))));
+        assert!(
+            !dispatcher.register_pg_callout(12, Box::new(|_, _, _| panic!("replaced callback")))
+        );
+        let (_, callback) = dispatcher.pg_callouts.borrow_mut().remove(&12).unwrap();
+        callback(12, 0, 0);
+        assert_eq!(called.get(), 1);
+    }
+
+    #[test]
+    fn context_cleanup_releases_captures_without_holding_map_borrow() {
+        struct Capture {
+            dispatcher: Rc<Dispatcher>,
+            dropped: Rc<Cell<bool>>,
+        }
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                assert!(self.dispatcher.pg_callouts.try_borrow_mut().is_ok());
+                self.dropped.set(true);
+            }
+        }
+        let dispatcher = Rc::new(Dispatcher::new());
+        let dropped = Rc::new(Cell::new(false));
+        let capture = Capture {
+            dispatcher: dispatcher.clone(),
+            dropped: dropped.clone(),
+        };
+        dispatcher.active_id.set(7);
+        dispatcher.register_pg_callout(12, Box::new(move |_, _, _| drop(capture)));
+        dispatcher.active_id.set(8);
+        dispatcher.register_pg_callout(20, Box::new(|_, _, _| {}));
+        dispatcher.remove_pg_context(7);
+        assert!(dropped.get());
+        assert!(!dispatcher.pg_callouts.borrow().contains_key(&12));
+        assert!(dispatcher.pg_callouts.borrow().contains_key(&20));
+    }
+
+    #[test]
+    fn callback_is_removed_before_reentrant_registration() {
+        let dispatcher = Rc::new(Dispatcher::new());
+        let inner = dispatcher.clone();
+        assert!(dispatcher.register_pg_callout(
+            12,
+            Box::new(move |_, _, _| {
+                assert!(inner.register_pg_callout(20, Box::new(|_, _, _| {})));
+            })
+        ));
+        let entry = dispatcher.pg_callouts.borrow_mut().remove(&12);
+        let (_, callback) = entry.unwrap();
+        callback(12, 0, 0);
+        assert!(dispatcher.pg_callouts.borrow().contains_key(&20));
+    }
 }
